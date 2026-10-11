@@ -1,0 +1,27 @@
+#!/bin/sh
+# /etc/update-motd.d/20-logo-mono-32
+# Prints the ASCII logo.  Install:
+#   install -m 0755 20-logo-mono-32 /etc/update-motd.d/20-logo-mono-32
+#   run-parts /etc/update-motd.d          # preview
+# Edit CAPTION below to change the tag line.
+# colour-free grey-block art, compact 32x16
+cat <<'DSH_LOGO'
+        ░░░░░░
+      ░░  ██▒░░███
+      ███████▓▓███████
+    ███▓▒░░░░░░▒▒▒▓████▓
+  ▓█▓▒░░░░░░░░░░░░░░▒▓███▓
+  ░░░░░░░░░░▒░░░░░░░░░▒███
+░░░░░░░░░░░░▒▒▒▒░░░░░░░▒██▒
+░░░░░░░░▓█▒░░░░░░░░░░░░░▒█▒
+▒░░░░░▒███▒▒▒▒▒░▒█▒░░░░░░▒▒▒▒
+░░░░░▓██ ██▓▒▒▒▓███▒░░░░░░░░░
+░░░▒▒▓███████████ ██▒░░░░░
+░░░░▒███████████ ▓██▓░▒░░▒▓▒░░
+░░░▒░▒████████████▓▓▒▒▒░░░░▒▓▓
+░▒▒▒▒▓█▒▓████████▓▒▒░░░░░░░░░
+░▒▒▒▒██  ▒▒▒▒▓▓▒░▒▒▒░░░░░░░░░░
+░▒░▒██░ ▒▓ ░▓█▓▒▒▒▒▒░░░▒▒▒░░░░░
+DSH_LOGO
+
+printf '\n%s\n\n' 'DSH Presents.  |  source: DSH.jpg'
