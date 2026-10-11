@@ -23,5 +23,3 @@ cat <<'DSH_LOGO'
 ░▒▒▒▒██  ▒▒▒▒▓▓▒░▒▒▒░░░░░░░░░░
 ░▒░▒██░ ▒▓ ░▓█▓▒▒▒▒▒░░░▒▒▒░░░░░
 DSH_LOGO
-
-printf '\n%s\n\n' 'DSH Presents.  |  source: DSH.jpg'
