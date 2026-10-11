@@ -1,0 +1,391 @@
+#!/bin/sh
+#
+# /etc/update-motd.d/25-sysinfo
+#
+# 登录面板：系统概况 + 负载/内存/磁盘占用条 + 连接构成 + 流量 + 最近登录
+#
+# 安装：
+#   install -m 0755 25-sysinfo /etc/update-motd.d/25-sysinfo
+#   run-parts /etc/update-motd.d
+#
+# 设计约定（改样式时请一并遵守，否则很容易"看着怪"）：
+#   * 标签一律 2 个汉字 = 显示宽度 4 列，所有行从同一列开始。
+#   * 只用单宽度字符：条用 █ ░，箭头用 ↓ ↑。不用 emoji，不用 ─ │ ┌ 这类
+#     "宽度歧义"字符——部分终端按 2 列渲染它们，会把整行挤到折行。
+#   * 条只表达「占用率」（0–100% 有意义）：负载 / 内存 / 磁盘 / 交换。
+#     连接数、构成比例没有"满格=危险"的含义，用对齐的彩色文字表达，
+#     免得把"18/142 是活跃连接"误读成"健康度只有 13%"。
+#   * 百分比右对齐到固定列，数值才能竖向扫读。
+#   * 颜色码由 printf '\033' 运行时生成，本文件不含任何控制字节。
+#   * 数据全部取自 /proc 与 /sys，不依赖 ss/netstat/ifconfig。
+
+USE_COLOR=1      # 1 = 彩色，0 = 纯文本
+USE_BOLD=1       # 1 = 标签加粗
+LOGINS=5         # 登录记录条数
+BAR_WIDTH=12     # 占用条宽度（字符数）
+WARN=60          # 黄条阈值（百分比）
+CRIT=85          # 红条阈值（百分比）
+SHOW_CONN=1      # 1 = 显示 连接 / 方向 / 累计
+SHOW_TRAFFIC=1   # 1 = 显示 流量
+NET_BARS=0       # 0 = 连接类用彩色文字（推荐）；1 = 改用构成条
+LOGIN_HEADER=1   # 1 = 登录表显示列标题
+HIDE_CURRENT=0   # 1 = 登录记录里隐藏本次会话，会连别人的在线会话一起隐藏
+NET_IFACE=''     # 流量统计的网卡，留空自动取默认路由网卡
+
+BAR_FULL='█'     # 占用条：已完成
+BAR_EMPTY='░'    # 占用条：空槽
+SEG_1='█'        # 构成条：第一段（配合 NET_BARS=1）
+SEG_2='▒'        # 构成条：第二段
+SEG_3='░'        # 构成条：其余
+
+# 登录表列标题：与下面的 %-14s %-8s %-16s %s 逐列对齐
+# （"开始"占 4 列 + 11 空格 = 14；"用户" 4 + 5 = 8；"来源" 4 + 13 = 16）
+LOGIN_HDR='开始           用户     来源             时长'
+
+esc=$(printf '\033')
+if [ "$USE_COLOR" = 1 ] && [ ${#esc} -eq 1 ]; then
+	if [ "$USE_BOLD" = 1 ]; then
+		C="${esc}[1;36m"    # 粗体青：标签
+	else
+		C="${esc}[36m"
+	fi
+	D="${esc}[90m"          # 灰：次要信息 / 空槽 / 表头
+	G="${esc}[32m"          # 绿：正常 / 第一组数值
+	Y="${esc}[33m"          # 黄：偏高
+	R="${esc}[31m"          # 红：吃紧
+	K="${esc}[36m"          # 青：第二组数值
+	Z="${esc}[0m"           # 复位
+	COLOR=1
+else
+	C=''; D=''; G=''; Y=''; R=''; K=''; Z=''
+	COLOR=0
+fi
+
+# ------------------------------------------------------------------ 绘制
+# 占用条：bar <百分比整数>
+bar() {
+	_p=$1
+	case "$_p" in ''|*[!0-9]*) _p=0 ;; esac
+	[ "$_p" -gt 100 ] && _p=100
+	_n=$(( (_p * BAR_WIDTH + 50) / 100 ))
+	_f=''
+	_e=''
+	_i=0
+	while [ "$_i" -lt "$_n" ]; do
+		_f="$_f$BAR_FULL"
+		_i=$(( _i + 1 ))
+	done
+	_i=0
+	while [ "$_i" -lt "$(( BAR_WIDTH - _n ))" ]; do
+		_e="$_e$BAR_EMPTY"
+		_i=$(( _i + 1 ))
+	done
+	if [ "$COLOR" = 1 ]; then
+		if [ "$_p" -ge "$CRIT" ]; then
+			_c=$R
+		elif [ "$_p" -ge "$WARN" ]; then
+			_c=$Y
+		else
+			_c=$G
+		fi
+		printf '%s%s%s%s%s' "$_c" "$_f" "$D" "$_e" "$Z"
+	else
+		printf '%s%s' "$_f" "$_e"
+	fi
+}
+
+# 构成条：sbar <值1> <值2> [值3] -> 输出 "<彩条> <值1占比>"
+sbar() {
+	awk -v a="${1:-0}" -v b="${2:-0}" -v c="${3:-0}" -v w="$BAR_WIDTH" \
+	    -v e="$esc" -v s1="$SEG_1" -v s2="$SEG_2" -v s3="$SEG_3" '
+		function rep(ch, n,   i, s) {
+			s = ""
+			for (i = 0; i < n; i++) s = s ch
+			return s
+		}
+		function cl(k) { return (e == "") ? "" : e "[" k "m" }
+		BEGIN {
+			v[1] = a + 0
+			v[2] = b + 0
+			v[3] = c + 0
+			t = v[1] + v[2] + v[3]
+			n[1] = 0; n[2] = 0; n[3] = 0
+			if (t <= 0) {
+				printf "%s%s %d\n", cl(90), rep(s3, w), 0
+				exit
+			}
+			# 非零项先各占 1 格，剩余格按比例分，最后修正累计误差
+			left = w
+			for (i = 1; i <= 3; i++) {
+				if (v[i] > 0) { n[i] = 1; left-- }
+			}
+			if (left > 0) {
+				got = 0
+				for (i = 1; i <= 3; i++) {
+					if (v[i] > 0) {
+						k = int(v[i] * left / t + 0.5)
+						n[i] += k
+						got += k
+					}
+				}
+				d = left - got
+				if (d != 0) {
+					j = 1
+					for (i = 2; i <= 3; i++) if (v[i] > v[j]) j = i
+					n[j] += d
+				}
+			}
+			if (n[1] + n[2] + n[3] != w) {
+				j = 1
+				for (i = 2; i <= 3; i++) if (v[i] > v[j]) j = i
+				n[j] += w - n[1] - n[2] - n[3]
+			}
+			printf "%s%s%s%s%s%s%s %d\n", cl(32), rep(s1, n[1]), \
+				cl(36), rep(s2, n[2]), cl(90), rep(s3, n[3]), cl(0), \
+				int(v[1] * 100 / t + 0.5)
+		}'
+}
+
+# 带占用条的一行：rowbar <标签> <百分比> <事实>
+rowbar() { printf ' %s%s%s  %s  %s%3s%%%s  %s\n' "$C" "$1" "$Z" "$(bar "$2")" "$D" "$2" "$Z" "$3"; }
+
+# 带构成条的一行：srow <标签> <值1> <值2> [值3] <事实>
+srow() {
+	read -r _bar _pct <<EOF
+$(sbar "$2" "$3" "${4:-0}")
+EOF
+	printf ' %s%s%s  %s  %s%3s%%%s  %s\n' "$C" "$1" "$Z" "$_bar" "$D" "$_pct" "$Z" "$5"
+}
+
+# 纯文字一行：crow <标签> <内容>（内容里可带颜色）
+crow() { printf ' %s%s%s  %s\n' "$C" "$1" "$Z" "$2"; }
+
+# 连接/流量行：NET_BARS=1 时改用构成条
+netrow() {
+	if [ "$NET_BARS" = 1 ]; then
+		srow "$1" "$2" "$3" "${4:-0}" "$5"
+	else
+		crow "$1" "$5"
+	fi
+}
+
+# 无条的信息行
+row() { printf ' %s%s%s  %s\n' "$C" "$1" "$Z" "$2"; }
+
+# ------------------------------------------------------------------ 系统
+os=$( . /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-Linux}" )
+kern=$(uname -r)
+arch=$(uname -m)
+host=$(uname -n)
+# "up 12 weeks, 3 days, 15 hours, 51 minutes" -> "12 weeks, 3 days"
+up=$(uptime -p 2>/dev/null | sed 's/^up //')
+up=$(printf '%s' "$up" | awk -F', ' '{ if (NF > 2) printf "%s, %s", $1, $2; else printf "%s", $0 }')
+
+cores=$(nproc 2>/dev/null)
+[ -n "$cores" ] || cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null)
+[ -n "$cores" ] || cores=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)
+[ -n "$cores" ] || cores=1
+
+loads=$(awk '{printf "%s %s %s", $1, $2, $3}' /proc/loadavg 2>/dev/null)
+l1=$(awk '{print $1}' /proc/loadavg 2>/dev/null)
+# 负载条 = load1 / 核数：100% 表示每核一个可运行任务
+lp=$(awk -v l="${l1:-0}" -v c="$cores" 'BEGIN{ p = (c > 0) ? l * 100 / c : 0; if (p > 999) p = 999; printf "%d", p }')
+
+mem=$(awk '
+	function h(k) {
+		if (k >= 1048576) return sprintf("%.1fG", k / 1048576)
+		if (k >= 1024)    return sprintf("%dM", k / 1024)
+		return sprintf("%dK", k)
+	}
+	/^MemTotal:/     { t = $2 }
+	/^MemAvailable:/ { a = $2 }
+	/^MemFree:/      { f = $2 }
+	END {
+		if (!t) exit
+		if (!a) a = f
+		printf "%d %s %s", (t - a) * 100 / t, h((t - a) * 1024), h(t * 1024)
+	}' /proc/meminfo)
+mp=''; mu=''; mt=''
+if [ -n "$mem" ]; then
+	read -r mp mu mt <<EOF
+$mem
+EOF
+fi
+
+swap=$(awk '/^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{if (t > 0) printf "%d", (t - f) * 100 / t}' /proc/meminfo)
+swtext=$(awk '/^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{if (t > 0) printf "%dM / %dM", (t - f) / 1024, t / 1024}' /proc/meminfo)
+
+# 真实挂载点，每个一行：mount 百分比 已用 总量
+disks=$(df -h --output=target,pcent,used,size -x tmpfs -x devtmpfs -x vfat -x squashfs 2>/dev/null \
+	| awk 'NR > 1 { sub(/%$/, "", $2); print $1, $2, $3, $4 }' | head -n 3)
+[ -n "$disks" ] || disks=$(df -h / 2>/dev/null | awk 'NR == 2 { sub(/%$/, "", $5); print $6, $5, $3, $2 }')
+
+users=$(who 2>/dev/null | wc -l | tr -d ' ')
+procs=$(ls -d /proc/[0-9]* 2>/dev/null | wc -l | tr -d ' ')
+
+# ------------------------------------------------------------------ 连接
+# /proc/net/tcp{,6} 的 st 列是十六进制状态：01=ESTABLISHED  0A=LISTEN
+# 方向判定：本地端口落在 LISTEN 集合里 = 入站（被连）；否则 = 出站（本机主动发起）
+conn=$(awk '
+	FNR > 1 && NF >= 4 {
+		total++
+		st = $4
+		split($2, a, ":")
+		if (st == "0A") {
+			ln++
+			listen[a[2]] = 1
+		} else if (st == "01") {
+			est++
+			eport[a[2]]++
+		}
+	}
+	END {
+		inb = 0
+		outb = 0
+		for (p in eport) {
+			if (p in listen) inb += eport[p]
+			else outb += eport[p]
+		}
+		printf "%d %d %d %d %d", total + 0, est + 0, outb, inb, ln + 0
+	}' /proc/net/tcp /proc/net/tcp6 2>/dev/null)
+
+# 累计建连：/proc/net/snmp 的 Tcp: 行按列名定位 ActiveOpens / PassiveOpens
+# 输出 原值+显示值：原值给条算比例，显示值给人看
+opens=$(awk '
+	function hn(x) {
+		if (x >= 1000000) return sprintf("%.1fM", x / 1000000)
+		if (x >= 10000)   return sprintf("%.1fk", x / 1000)
+		return sprintf("%d", x)
+	}
+	/^Tcp:/ {
+		if (!got) {
+			for (i = 2; i <= NF; i++) {
+				if ($i == "ActiveOpens")  ai = i
+				if ($i == "PassiveOpens") pi = i
+			}
+			got = 1
+			next
+		}
+		if (ai && pi) printf "%d %d %s %s", $ai + 0, $pi + 0, hn($ai + 0), hn($pi + 0)
+	}' /proc/net/snmp 2>/dev/null)
+
+# ------------------------------------------------------------------ 流量
+iface=$NET_IFACE
+[ -n "$iface" ] || iface=$(awk '$2 == "00000000" { print $1; exit }' /proc/net/route 2>/dev/null)
+[ -n "$iface" ] || iface=$(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | head -n 1)
+
+# 输出 原值+显示值+均速
+traffic=''
+[ -n "$iface" ] && traffic=$(awk -v n="$iface" '
+	function h(k) {
+		if (k >= 1073741824) return sprintf("%.1fG", k / 1073741824)
+		if (k >= 1048576)    return sprintf("%.1fM", k / 1048576)
+		if (k >= 1024)       return sprintf("%.1fK", k / 1024)
+		return sprintf("%dB", k)
+	}
+	BEGIN {
+		rf = "/sys/class/net/" n "/statistics/rx_bytes"
+		tf = "/sys/class/net/" n "/statistics/tx_bytes"
+		if ((getline rv < rf) <= 0) exit
+		if ((getline tv < tf) <= 0) exit
+		rv += 0
+		tv += 0
+		up = 1
+		if ((getline u < "/proc/uptime") > 0) up = (u + 0 > 0) ? u + 0 : 1
+		printf "%d %d %s %s %s %s", rv, tv, h(rv), h(tv), h(rv / up), h(tv / up)
+	}' 2>/dev/null)
+
+ctotal=''; cest=''; cout=''; cin=''; clisten=''
+if [ -n "$conn" ]; then
+	read -r ctotal cest cout cin clisten <<EOF
+$conn
+EOF
+fi
+oar=''; opr=''; oa=''; op=''
+if [ -n "$opens" ]; then
+	read -r oar opr oa op <<EOF
+$opens
+EOF
+fi
+rxr=''; txr=''; rxv=''; txv=''; rrate=''; trate=''
+if [ -n "$traffic" ]; then
+	read -r rxr txr rxv txv rrate trate <<EOF
+$traffic
+EOF
+fi
+
+if [ "$HIDE_CURRENT" = 1 ]; then
+	drop='still logged in'
+else
+	drop='@@never-matches@@'
+fi
+
+# 登录记录：重排成对齐表格（last 原始输出的宽间距很难看）
+# LC_ALL=C 保证月份是英文 Jan..Dec，字段位置固定
+logins=$(LC_ALL=C last -i -n 100 2>/dev/null | awk -v n="$LOGINS" -v drop="$drop" -v e="$esc" '
+	BEGIN {
+		split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", mn, " ")
+		for (i = 1; i <= 12; i++) mon[mn[i]] = i
+	}
+	$2 ~ /^pts\// {
+		if (index($0, drop) > 0) next
+		if (++shown > n) exit
+		start = sprintf("%02d-%02d %s", mon[$5] + 0, $6 + 0, $7)
+		if (index($0, "still logged in") > 0) {
+			dur = (e == "") ? "在线" : e "[32m在线" e "[0m"
+		} else if ($NF ~ /^\([0-9]/) {
+			d = $NF
+			gsub(/[()]/, "", d)
+			dur = d
+		} else {
+			dur = "-"
+		}
+		printf "   %-14s %-8s %-16s %s\n", start, $1, $3, dur
+	}')
+
+# ------------------------------------------------------------------ 输出
+# 前面 20-logo 已经输出过空行，这里不再补
+row "系统" "$os · $kern · $arch"
+row "主机" "$host${up:+ · $up}${users:+ · 在线 $users 人}${procs:+ · 进程 $procs}"
+
+# 占用率一组
+printf '\n'
+[ -n "$lp" ] && rowbar "负载" "$lp" "${loads:-n/a} · ${cores} 核"
+[ -n "$mem" ] && rowbar "内存" "$mp" "$mu / $mt"
+[ -n "$swap" ] && rowbar "交换" "$swap" "$swtext"
+if [ -n "$disks" ]; then
+	_first=1
+	while read -r _mnt _pct _used _size; do
+		[ -n "$_mnt" ] || continue
+		if [ "$_first" = 1 ]; then _lbl='磁盘'; _first=0; else _lbl='    '; fi
+		rowbar "$_lbl" "$_pct" "$_mnt $_used / $_size"
+	done <<EOF
+$disks
+EOF
+fi
+
+# 连接与流量一组
+if { [ "$SHOW_CONN" = 1 ] && [ -n "$ctotal" ]; } || { [ "$SHOW_TRAFFIC" = 1 ] && [ -n "$rxr" ]; }; then
+	printf '\n'
+fi
+if [ "$SHOW_CONN" = 1 ] && [ -n "$ctotal" ]; then
+	cother=$(( ctotal - cest - clisten ))
+	[ "$cother" -lt 0 ] && cother=0
+	netrow "连接" "$cest" "$clisten" "$cother" \
+		"${ctotal} 个 · ${G}建立 ${cest}${Z} · ${K}监听 ${clisten}${Z} · ${D}其他 ${cother}${Z}"
+	netrow "方向" "$cout" "$cin" 0 \
+		"${G}出站 ${cout}${Z} · ${K}入站 ${cin}${Z}"
+	[ -n "$oar" ] && netrow "累计" "$oar" "$opr" 0 \
+		"${G}主动建连 ${oa}${Z} · ${K}被动建连 ${op}${Z} · ${D}开机以来${Z}"
+fi
+[ "$SHOW_TRAFFIC" = 1 ] && [ -n "$rxr" ] && netrow "流量" "$rxr" "$txr" 0 \
+	"${iface} ${G}↓ ${rxv}${Z} ${K}↑ ${txv}${Z} · ${D}均速${Z} ${G}↓ ${rrate}/s${Z} ${K}↑ ${trate}/s${Z}"
+
+# 登录记录
+printf '\n %s%s%s\n' "$C" "最近 $LOGINS 次 SSH 登录" "$Z"
+if [ -n "$logins" ]; then
+	[ "$LOGIN_HEADER" = 1 ] && printf '   %s%s%s\n' "$D" "$LOGIN_HDR" "$Z"
+	printf '%s\n' "$logins"
+else
+	printf '   %s读不到登录记录（/var/log/wtmp 为空或不可读）%s\n' "$D" "$Z"
+fi
